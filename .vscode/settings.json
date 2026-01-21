@@ -1,0 +1,12 @@
+{
+    "sqltools.connections": [
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "localhost",
+            "driver": "PostgreSQL",
+            "name": "kimteach-DB",
+            "connectString": "postgresql://postgres.ybbpbjirxnwtkonoggme:123kimteach123@aws-1-ap-northeast-2.pooler.supabase.com:6543/postgres"
+        }
+    ]
+}

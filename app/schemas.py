@@ -1,6 +1,11 @@
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
+# ===== Request Schemas =====
+# 로그인관련
+class LoginRequest(BaseModel):
+    email: str    # <--- 여기가 로그인할 때 쓰는 ID
+    password: str
 
 # --- 기본 모델 ---
 class PageBase(BaseModel):
@@ -9,7 +14,7 @@ class PageBase(BaseModel):
 
     class Config:
         from_attributes = True
-
+# ===== Response Schemas ===== > 정리 
 class PdfBase(BaseModel):
     pdf_id: int
     file_name: str

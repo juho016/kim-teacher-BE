@@ -1,7 +1,22 @@
+import uuid 
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from .database import Base
+from sqlalchemy.dialects.postgresql import UUID
+
+
+# 0.사용자정보
+class UserAccount(Base):
+    __tablename__ = "user_account"  # 테이블 이름
+
+    # 1. user_id: UUID 타입 (PK)
+    user_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    nickname = Column(String(100))
+    registration_date = Column(DateTime(timezone=True), server_default=func.now())
+
 
 # 1. PDF 메타데이터
 class Pdf(Base):

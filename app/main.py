@@ -1,15 +1,26 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from .database import get_db, engine
-from . import models, schemas
+from app.database import get_db, engine
+from app import models, schemas
 import io
 from pypdf import PdfReader
+from fastapi.middleware.cors import CORSMiddleware
 
 # DB 테이블 자동 생성 (서버 시작 시)
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
+# 접근권한 설정
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 모든 곳에서의 접속을 허용 (개발용 꼼수)
+    allow_credentials=True,
+    allow_methods=["*"],  # 모든 메소드(GET, POST 등) 허용
+    allow_headers=["*"],  # 모든 헤더 허용
+)
+
 
 @app.get("/")
 def read_root():
@@ -22,6 +33,24 @@ def db_check(db: Session = Depends(get_db)):
         return {"status": "success", "message": "DB Connected!", "result": result.scalar()}
     except Exception as e:
         return {"status": "fail", "error": str(e)}
+
+
+@app.post("/login")
+def login(request: schemas.LoginRequest, db: Session = Depends(get_db)):
+    # 1. DB의 'email' 컬럼에서 찾기
+    user = db.query(models.UserAccount).filter(models.UserAccount.email == request.email).first()
+
+    if not user:
+        raise HTTPException(status_code=401, detail="존재하지 않는 이메일입니다.")
+    
+    if user.password_hash != request.password:
+        raise HTTPException(status_code=401, detail="비밀번호가 틀렸습니다.")
+
+    return {
+        "message": "로그인 성공", 
+        "user_id": str(user.user_id), # UUID는 문자열로 변환해서 줌
+        "nickname": user.nickname
+    }
 
 # --- 1순위: 학습 화면 진입 API ---
 @app.get("/study/{pdf_id}", response_model=schemas.StudyInitResponse)
