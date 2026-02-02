@@ -3,12 +3,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from .database import get_db, engine, SessionLocal
 from . import models, schemas
-from .ai import structure, tutor # AI 모듈 임포트
+from .ai import structure, tutor, quiz # AI 모듈 임포트
 import io
 import os
 import uuid
 from pypdf import PdfReader
-# from openai import OpenAI # 제거
+from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
 
 # DB 테이블 자동 생성
@@ -53,8 +53,7 @@ def process_document_structure(pdf_id: uuid.UUID):
             if page.page_text:
                 full_text += f"--- Page {page.page_number} ---\n{page.page_text}\n\n"
         
-        # [수정] 토큰 제한을 피하기 위해 텍스트 길이를 3000자로 대폭 축소
-        full_text = full_text[:3000]
+        full_text = full_text[:3000] 
 
         structure_response = structure.analyze_document_structure(full_text)
 
@@ -110,6 +109,46 @@ def process_lecture_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
 
     except Exception as e:
         print(f"Error in lecture generation: {e}")
+    finally:
+        db.close()
+
+# --- Background Task: 퀴즈 생성 ---
+def process_quiz_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
+    db = SessionLocal()
+    try:
+        concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
+        if not concept: return
+
+        pages = db.query(models.PdfPage).filter(
+            models.PdfPage.pdf_id == concept.pdf_id,
+            models.PdfPage.page_number >= concept.start_page,
+            models.PdfPage.page_number <= concept.end_page
+        ).order_by(models.PdfPage.page_number).all()
+
+        concept_text = "\n".join([p.page_text for p in pages if p.page_text])
+        
+        if not concept_text: return
+
+        # 퀴즈 생성 (기본 3문제)
+        quiz_response = quiz.generate_quizzes(concept.title, concept_text, num_quizzes=3)
+
+        for q in quiz_response.quizzes:
+            new_quiz = models.AiGeneratedQuiz(
+                quiz_id=uuid.uuid4(),
+                room_id=room_id,
+                concept_id=concept_id,
+                question=q.question,
+                choices=q.choices,
+                correct_answer=q.correct_answer,
+                explanation=q.explanation
+            )
+            db.add(new_quiz)
+        
+        db.commit()
+        print(f"Quizzes generated for concept {concept.title}")
+
+    except Exception as e:
+        print(f"Error in quiz generation: {e}")
     finally:
         db.close()
 
@@ -231,7 +270,24 @@ def generate_lecture(concept_id: uuid.UUID, request: schemas.AnalysisRequest, ba
         "message": "Lecture script generation started in background."
     }
 
-# --- 5. 분석 결과 조회 ---
+# --- 5. 개념별 퀴즈 생성 요청 ---
+@app.post("/concepts/{concept_id}/quiz", response_model=schemas.AnalysisResponse)
+def generate_quiz(concept_id: uuid.UUID, request: schemas.AnalysisRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
+    if not concept: raise HTTPException(status_code=404, detail="Concept not found")
+
+    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first()
+    if not room: raise HTTPException(status_code=404, detail="Room not found")
+
+    background_tasks.add_task(process_quiz_generation, concept_id, request.room_id)
+
+    return {
+        "pdf_id": concept.pdf_id,
+        "room_id": request.room_id,
+        "message": "Quiz generation started in background."
+    }
+
+# --- 6. 분석 결과 조회 ---
 @app.get("/pdf/{pdf_id}/pages", response_model=schemas.PdfPagesDetailResponse)
 def get_pdf_pages_detail(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
     pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
@@ -245,7 +301,7 @@ def get_pdf_pages_detail(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
         "pages": pages
     }
 
-# --- 6. [NEW] 개념 목록 조회 API ---
+# --- 7. 개념 목록 조회 API ---
 @app.get("/pdf/{pdf_id}/concepts", response_model=schemas.ConceptListResponse)
 def get_pdf_concepts(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
     pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
@@ -256,4 +312,82 @@ def get_pdf_concepts(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
     return {
         "pdf_id": pdf.pdf_id,
         "concepts": concepts
+    }
+
+# --- 8. [NEW] 퀴즈 목록 조회 (풀이용) ---
+@app.get("/concepts/{concept_id}/quizzes", response_model=schemas.QuizListResponse)
+def get_concept_quizzes(concept_id: uuid.UUID, db: Session = Depends(get_db)):
+    quizzes = db.query(models.AiGeneratedQuiz).filter(models.AiGeneratedQuiz.concept_id == concept_id).all()
+    
+    return {
+        "concept_id": concept_id,
+        "quizzes": quizzes
+    }
+
+# --- 9. [NEW] 퀴즈 답안 제출 및 채점 ---
+@app.post("/quizzes/submit", response_model=schemas.QuizResultResponse)
+def submit_quiz(submission: schemas.QuizSubmission, db: Session = Depends(get_db)):
+    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == submission.room_id).first()
+    if not room: raise HTTPException(status_code=404, detail="Room not found")
+
+    total_questions = len(submission.answers)
+    score = 0
+    wrong_answers_to_save = []
+    quiz_ids = []
+
+    for answer in submission.answers:
+        quiz = db.query(models.AiGeneratedQuiz).filter(models.AiGeneratedQuiz.quiz_id == answer.quiz_id).first()
+        if not quiz: continue
+        
+        quiz_ids.append(quiz.quiz_id)
+
+        # 정답 비교 (대소문자 무시, 공백 제거 등 유연하게 처리)
+        is_correct = quiz.correct_answer.strip().lower() == answer.selected_answer.strip().lower()
+        
+        if is_correct:
+            score += 1
+        else:
+            # 오답 노트 생성
+            wrong_answer = models.WrongAnswer(
+                wrong_id=uuid.uuid4(),
+                # quiz_history_id는 아래에서 생성 후 연결
+                question=quiz.question,
+                your_answer=answer.selected_answer,
+                correct_answer=quiz.correct_answer,
+                explanation=quiz.explanation
+            )
+            wrong_answers_to_save.append(wrong_answer)
+
+    # 퀴즈 풀이 기록 저장
+    history = models.QuizHistory(
+        quiz_history_id=uuid.uuid4(),
+        room_id=submission.room_id,
+        generated_quiz_ids=quiz_ids,
+        score=score,
+        total_questions=total_questions,
+        duration_seconds=submission.duration_seconds
+    )
+    db.add(history)
+    db.commit() # history ID 생성을 위해 커밋
+
+    # 오답 노트에 history_id 연결 및 저장
+    for wa in wrong_answers_to_save:
+        wa.quiz_history_id = history.quiz_history_id
+        db.add(wa)
+    
+    db.commit()
+
+    # 결과 반환
+    return {
+        "quiz_history_id": history.quiz_history_id,
+        "score": score,
+        "total_questions": total_questions,
+        "wrong_answers": [
+            {
+                "question": wa.question,
+                "your_answer": wa.your_answer,
+                "correct_answer": wa.correct_answer,
+                "explanation": wa.explanation
+            } for wa in wrong_answers_to_save
+        ]
     }

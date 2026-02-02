@@ -102,7 +102,17 @@ class LectureScript(BaseModel):
     example: Optional[str] = Field(None, description="A simple example to help understanding.")
     check_question: str = Field(..., description="A simple question to check if the user understood.")
 
-# --- [NEW] 개념 목록 조회 응답 ---
+# --- GPT가 반환할 퀴즈 JSON 스키마 ---
+class QuizItem(BaseModel):
+    question: str = Field(..., description="The quiz question.")
+    choices: List[str] = Field(..., description="List of 4 choices.")
+    correct_answer: str = Field(..., description="The correct answer (must be one of the choices).")
+    explanation: str = Field(..., description="Explanation of why the answer is correct.")
+
+class QuizGenerationResponse(BaseModel):
+    quizzes: List[QuizItem] = Field(..., description="List of generated quizzes.")
+
+# --- 개념 목록 조회 응답 ---
 class ConceptInfo(BaseModel):
     concept_id: UUID
     title: str
@@ -117,3 +127,38 @@ class ConceptInfo(BaseModel):
 class ConceptListResponse(BaseModel):
     pdf_id: UUID
     concepts: List[ConceptInfo]
+
+# --- [NEW] 퀴즈 풀이 관련 스키마 ---
+class QuizInfo(BaseModel):
+    quiz_id: UUID
+    question: str
+    choices: List[str]
+    # 정답은 클라이언트에게 보내지 않음 (보안)
+
+    class Config:
+        from_attributes = True
+
+class QuizListResponse(BaseModel):
+    concept_id: UUID
+    quizzes: List[QuizInfo]
+
+class UserAnswer(BaseModel):
+    quiz_id: UUID
+    selected_answer: str
+
+class QuizSubmission(BaseModel):
+    room_id: UUID
+    answers: List[UserAnswer]
+    duration_seconds: int
+
+class WrongAnswerInfo(BaseModel):
+    question: str
+    your_answer: str
+    correct_answer: str
+    explanation: str
+
+class QuizResultResponse(BaseModel):
+    quiz_history_id: UUID
+    score: int
+    total_questions: int
+    wrong_answers: List[WrongAnswerInfo]

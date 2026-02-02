@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Boolean, JSON
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Boolean, JSON, ARRAY
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -48,7 +48,9 @@ class LearningRoom(Base):
 
     pdf = relationship("Pdf", back_populates="rooms")
     extractions = relationship("PdfExtractionPage", back_populates="room")
-    scripts = relationship("AiTutorScript", back_populates="room") # 추가
+    scripts = relationship("AiTutorScript", back_populates="room")
+    quizzes = relationship("AiGeneratedQuiz", back_populates="room")
+    quiz_histories = relationship("QuizHistory", back_populates="room") # 추가
 
 class PdfExtractionPage(Base):
     __tablename__ = 'pdf_extraction_page'
@@ -77,15 +79,55 @@ class Concept(Base):
 
     pdf = relationship("Pdf", back_populates="concepts")
 
-# --- [NEW] AI 튜터 스크립트 테이블 ---
 class AiTutorScript(Base):
     __tablename__ = 'ai_tutor_script'
     script_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
-    concept_id = Column(UUID(as_uuid=True), ForeignKey('concept.concept_id'), nullable=True) # 어떤 개념에 대한 스크립트인지
+    concept_id = Column(UUID(as_uuid=True), ForeignKey('concept.concept_id'), nullable=True)
     generated_at = Column(DateTime(timezone=True), server_default=func.now())
     lecture_text = Column(Text, nullable=True)
     audio_url = Column(Text, nullable=True)
     tts_voice_style = Column(String(50), nullable=True)
 
     room = relationship("LearningRoom", back_populates="scripts")
+
+class AiGeneratedQuiz(Base):
+    __tablename__ = 'ai_generated_quiz'
+    quiz_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
+    concept_id = Column(UUID(as_uuid=True), ForeignKey('concept.concept_id'), nullable=True)
+    generation_time = Column(DateTime(timezone=True), server_default=func.now())
+    question = Column(Text, nullable=False)
+    choices = Column(JSON, nullable=True)
+    correct_answer = Column(Text, nullable=False)
+    explanation = Column(Text, nullable=True)
+
+    room = relationship("LearningRoom", back_populates="quizzes")
+
+# --- [NEW] 퀴즈 풀이 기록 ---
+class QuizHistory(Base):
+    __tablename__ = 'quiz_history'
+    quiz_history_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
+    generated_quiz_ids = Column(ARRAY(UUID(as_uuid=True)), nullable=True) # 어떤 문제들을 풀었는지
+    score = Column(Integer, default=0)
+    total_questions = Column(Integer, default=0)
+    start_time = Column(DateTime(timezone=True), server_default=func.now())
+    duration_seconds = Column(Integer, default=0)
+
+    room = relationship("LearningRoom", back_populates="quiz_histories")
+    wrong_answers = relationship("WrongAnswer", back_populates="history")
+
+# --- [NEW] 오답 노트 ---
+class WrongAnswer(Base):
+    __tablename__ = 'wrong_answer'
+    wrong_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    quiz_history_id = Column(UUID(as_uuid=True), ForeignKey('quiz_history.quiz_history_id'), nullable=False)
+    question = Column(Text, nullable=False)
+    your_answer = Column(Text, nullable=True)
+    correct_answer = Column(Text, nullable=True)
+    explanation = Column(Text, nullable=True)
+    review_count = Column(Integer, default=0)
+    is_mastered = Column(Boolean, default=False)
+
+    history = relationship("QuizHistory", back_populates="wrong_answers")
