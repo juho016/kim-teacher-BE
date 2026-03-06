@@ -9,3 +9,7 @@ __pycache__/
 .env
 
 .idea/
+
+*.db
+
+#uvicorn app.main:app --reload
