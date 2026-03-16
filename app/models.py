@@ -1,11 +1,9 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Boolean, JSON, ARRAY
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Boolean, JSON, ARRAY, Float
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import uuid
 from .database import Base
-
-# --- 신규 통합 모델 (UUID 기반) ---
 
 class UserAccount(Base):
     __tablename__ = 'user_account'
@@ -13,6 +11,10 @@ class UserAccount(Base):
     email = Column(String(255), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     nickname = Column(String(100))
+
+    pdfs = relationship("Pdf", back_populates="user")
+    learning_rooms = relationship("LearningRoom", back_populates="user")
+    # chat_logs = relationship("StudyChatLog", back_populates="user") # 순환 참조 문제로 잠시 주석 처리
 
 class Pdf(Base):
     __tablename__ = 'pdf'
@@ -22,6 +24,7 @@ class Pdf(Base):
     storage_url = Column(Text, nullable=True)
     upload_date = Column(DateTime(timezone=True), server_default=func.now())
     
+    user = relationship("UserAccount", back_populates="pdfs")
     pages = relationship("PdfPage", back_populates="pdf")
     rooms = relationship("LearningRoom", back_populates="pdf")
     concepts = relationship("Concept", back_populates="pdf")
@@ -46,11 +49,15 @@ class LearningRoom(Base):
     last_study_date = Column(DateTime(timezone=True), server_default=func.now())
     study_goal = Column(Text, nullable=True)
 
+    user = relationship("UserAccount", back_populates="learning_rooms")
     pdf = relationship("Pdf", back_populates="rooms")
     extractions = relationship("PdfExtractionPage", back_populates="room")
     scripts = relationship("AiTutorScript", back_populates="room")
     quizzes = relationship("AiGeneratedQuiz", back_populates="room")
-    quiz_histories = relationship("QuizHistory", back_populates="room") # 추가
+    quiz_histories = relationship("QuizHistory", back_populates="room")
+    mastery_levels = relationship("ConceptMastery", back_populates="room")
+    weakness_diagnoses = relationship("WeaknessDiagnosis", back_populates="room")
+    # chat_logs = relationship("StudyChatLog", back_populates="room") # 순환 참조 문제로 잠시 주석 처리
 
 class PdfExtractionPage(Base):
     __tablename__ = 'pdf_extraction_page'
@@ -76,8 +83,14 @@ class Concept(Base):
     start_page = Column(Integer, nullable=False)
     end_page = Column(Integer, nullable=False)
     order_index = Column(Integer, nullable=False)
+    concept_type = Column(String(30), nullable=True)
+    hierarchy_level = Column(Integer, nullable=False, default=0)
+    parent_concept_id = Column(UUID(as_uuid=True), ForeignKey('concept.concept_id'), nullable=True)
+    path_text = Column(Text, nullable=True)
 
+    parent_concept = relationship("Concept", remote_side=[concept_id], backref="child_concepts")
     pdf = relationship("Pdf", back_populates="concepts")
+    mastery_levels = relationship("ConceptMastery", back_populates="concept")
 
 class AiTutorScript(Base):
     __tablename__ = 'ai_tutor_script'
@@ -104,12 +117,11 @@ class AiGeneratedQuiz(Base):
 
     room = relationship("LearningRoom", back_populates="quizzes")
 
-# --- [NEW] 퀴즈 풀이 기록 ---
 class QuizHistory(Base):
     __tablename__ = 'quiz_history'
     quiz_history_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
-    generated_quiz_ids = Column(ARRAY(UUID(as_uuid=True)), nullable=True) # 어떤 문제들을 풀었는지
+    generated_quiz_ids = Column(ARRAY(UUID(as_uuid=True)), nullable=True)
     score = Column(Integer, default=0)
     total_questions = Column(Integer, default=0)
     start_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -118,7 +130,6 @@ class QuizHistory(Base):
     room = relationship("LearningRoom", back_populates="quiz_histories")
     wrong_answers = relationship("WrongAnswer", back_populates="history")
 
-# --- [NEW] 오답 노트 ---
 class WrongAnswer(Base):
     __tablename__ = 'wrong_answer'
     wrong_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -131,3 +142,74 @@ class WrongAnswer(Base):
     is_mastered = Column(Boolean, default=False)
 
     history = relationship("QuizHistory", back_populates="wrong_answers")
+
+class ConceptMastery(Base):
+    __tablename__ = 'concept_mastery'
+    mastery_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
+    concept_id = Column(UUID(as_uuid=True), ForeignKey('concept.concept_id'), nullable=False)
+    mastery_state = Column(String(50), default="unseen")
+    last_accuracy = Column(Float, default=0.0)
+    avg_solve_time = Column(Float, default=0.0)
+    retry_count = Column(Integer, default=0, nullable=False)
+    revisit_count = Column(Integer, default=0, nullable=False)
+    last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    room = relationship("LearningRoom", back_populates="mastery_levels")
+    concept = relationship("Concept", back_populates="mastery_levels")
+
+class StudyChatLog(Base):
+    __tablename__ = 'study_chat_log'
+    log_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('user_account.user_id'), nullable=True)
+    role = Column(String(20), nullable=False)
+    message = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # room = relationship("LearningRoom", back_populates="chat_logs")
+    # user = relationship("UserAccount", back_populates="chat_logs")
+
+class WeaknessDiagnosis(Base):
+    __tablename__ = 'weakness_diagnosis'
+    diagnosis_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
+    analysis_date = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    weak_area = Column(Text, nullable=True)
+    improvement_plan = Column(Text, nullable=True)
+
+    room = relationship("LearningRoom", back_populates="weakness_diagnoses")
+
+class Pdfs(Base): # 레거시 테이블 (사용 안 함)
+    __tablename__ = "pdfs"
+    id = Column(Integer, primary_key=True, index=True)
+    file_name = Column(String, nullable=False)
+    total_pages = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Pages(Base): # 레거시 테이블 (사용 안 함)
+    __tablename__ = "pages"
+    id = Column(Integer, primary_key=True, index=True)
+    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
+    page_number = Column(Integer, nullable=False)
+    text_content = Column(Text, nullable=True)
+    image_url = Column(String, nullable=True)
+
+class StudyProgress(Base): # 레거시 테이블 (사용 안 함)
+    __tablename__ = "study_progress"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True)
+    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
+    current_page = Column(Integer, default=1)
+    last_study_date = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    is_completed = Column(Boolean, default=False)
+
+class StudyLog(Base): # 레거시 테이블 (사용 안 함)
+    __tablename__ = "study_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True)
+    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
+    page_id = Column(Integer, ForeignKey("pages.id"), nullable=True)
+    action = Column(String, nullable=False)
+    stay_time = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

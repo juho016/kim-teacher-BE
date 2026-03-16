@@ -47,6 +47,47 @@ class LearningRoomResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# --- 진도 관련 스키마 ---
+class ProgressUpdate(BaseModel):
+    current_page: int
+
+class ProgressResponse(BaseModel):
+    room_id: UUID
+    current_page: int
+    total_pages: int
+    progress_percentage: float
+    last_study_date: datetime
+
+# --- 학습 통계 스키마 ---
+class StudyStatisticsResponse(BaseModel):
+    total_quizzes_taken: int
+    total_questions_solved: int
+    total_correct_answers: int
+    average_score: float
+    accuracy_rate: float
+    total_study_time_seconds: int
+
+# --- 약점 분석 스키마 ---
+class WeakConceptInfo(BaseModel):
+    concept_id: UUID
+    title: str
+    mastery_state: str
+    wrong_count: int
+
+class WeaknessAnalysisResponse(BaseModel):
+    room_id: UUID
+    weak_concepts: List[WeakConceptInfo]
+    message: str
+
+# --- [NEW] Q&A 관련 스키마 ---
+class QnARequest(BaseModel):
+    room_id: UUID
+    question: str
+
+class QnAResponse(BaseModel):
+    answer: str
+    log_id: UUID
+
 # --- 분석 결과 (Extraction) ---
 class ExtractionBase(BaseModel):
     summary: Optional[str] = None
@@ -120,6 +161,8 @@ class ConceptInfo(BaseModel):
     start_page: int
     end_page: int
     order_index: int
+    concept_type: Optional[str] = None
+    hierarchy_level: int
 
     class Config:
         from_attributes = True
@@ -128,12 +171,11 @@ class ConceptListResponse(BaseModel):
     pdf_id: UUID
     concepts: List[ConceptInfo]
 
-# --- [NEW] 퀴즈 풀이 관련 스키마 ---
+# --- 퀴즈 풀이 관련 스키마 ---
 class QuizInfo(BaseModel):
     quiz_id: UUID
     question: str
     choices: List[str]
-    # 정답은 클라이언트에게 보내지 않음 (보안)
 
     class Config:
         from_attributes = True
@@ -145,11 +187,11 @@ class QuizListResponse(BaseModel):
 class UserAnswer(BaseModel):
     quiz_id: UUID
     selected_answer: str
+    solve_time_seconds: float
 
 class QuizSubmission(BaseModel):
     room_id: UUID
     answers: List[UserAnswer]
-    duration_seconds: int
 
 class WrongAnswerInfo(BaseModel):
     question: str
@@ -162,3 +204,4 @@ class QuizResultResponse(BaseModel):
     score: int
     total_questions: int
     wrong_answers: List[WrongAnswerInfo]
+    updated_mastery: List[Dict[str, Any]]

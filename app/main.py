@@ -3,60 +3,46 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from .database import get_db, engine, SessionLocal
 from . import models, schemas
-from .ai import structure, tutor, quiz # AI 모듈 임포트
+from .ai import structure, tutor, quiz, qna # QnA 모듈 임포트
+from .analytics import engine as analytics_engine
 import io
 import os
 import uuid
 from pypdf import PdfReader
-from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
+from collections import Counter
 
-# DB 테이블 자동 생성
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# 접근권한 설정 (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 모든 곳에서의 접속을 허용 (개발용)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # 모든 메소드(GET, POST 등) 허용
-    allow_headers=["*"],  # 모든 헤더 허용
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# --- Helper: 고정 테스트 사용자 (test@test.com / 1234) ---
 def get_or_create_test_user(db: Session):
-    # 1. 고정된 이메일로 유저 찾기
     user = db.query(models.UserAccount).filter(models.UserAccount.email == "test@test.com").first()
-    
-    # 2. 없으면 생성
     if not user:
-        user = models.UserAccount(
-            user_id=uuid.uuid4(),
-            email="test@test.com",
-            password_hash="1234", # 실제로는 해시화해야 함
-            nickname="TestUser"
-        )
+        user = models.UserAccount(user_id=uuid.uuid4(), email="test@test.com", password_hash="1234", nickname="TestUser")
         db.add(user)
         db.commit()
         db.refresh(user)
     return user
 
-# --- Background Task: 문서 구조 분석 ---
+# --- Background Tasks ---
 def process_document_structure(pdf_id: uuid.UUID):
     db = SessionLocal()
     try:
         pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == pdf_id).order_by(models.PdfPage.page_number).all()
-        full_text = ""
-        for page in pages:
-            if page.page_text:
-                full_text += f"--- Page {page.page_number} ---\n{page.page_text}\n\n"
-        
-        full_text = full_text[:3000] 
+        full_text = "\n".join([p.page_text for p in pages if p.page_text])[:3000]
+        if not full_text: return
 
         structure_response = structure.analyze_document_structure(full_text)
-
         for idx, concept_data in enumerate(structure_response.concepts):
             concept = models.Concept(
                 concept_id=uuid.uuid4(),
@@ -65,329 +51,276 @@ def process_document_structure(pdf_id: uuid.UUID):
                 description=concept_data.description,
                 start_page=concept_data.start_page,
                 end_page=concept_data.end_page,
-                order_index=idx + 1
+                order_index=idx + 1,
+                concept_type="concept",
+                hierarchy_level=0,
             )
             db.add(concept)
-        
         db.commit()
         print(f"PDF {pdf_id} structure analysis completed.")
-
     except Exception as e:
         print(f"Error in structure analysis: {e}")
     finally:
         db.close()
 
-# --- Background Task: 튜터 스크립트 생성 ---
 def process_lecture_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
     db = SessionLocal()
     try:
         concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
         if not concept: return
-
-        pages = db.query(models.PdfPage).filter(
-            models.PdfPage.pdf_id == concept.pdf_id,
-            models.PdfPage.page_number >= concept.start_page,
-            models.PdfPage.page_number <= concept.end_page
-        ).order_by(models.PdfPage.page_number).all()
-
+        pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == concept.pdf_id, models.PdfPage.page_number >= concept.start_page, models.PdfPage.page_number <= concept.end_page).order_by(models.PdfPage.page_number).all()
         concept_text = "\n".join([p.page_text for p in pages if p.page_text])
-        
         if not concept_text: return
-
         script_data = tutor.generate_lecture_script(concept.title, concept_text)
-
-        new_script = models.AiTutorScript(
-            script_id=uuid.uuid4(),
-            room_id=room_id,
-            concept_id=concept_id,
-            lecture_text=script_data.script,
-            tts_voice_style="default"
-        )
+        new_script = models.AiTutorScript(script_id=uuid.uuid4(), room_id=room_id, concept_id=concept_id, lecture_text=script_data.script)
         db.add(new_script)
         db.commit()
         print(f"Lecture script generated for concept {concept.title}")
-
     except Exception as e:
         print(f"Error in lecture generation: {e}")
     finally:
         db.close()
 
-# --- Background Task: 퀴즈 생성 ---
 def process_quiz_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
     db = SessionLocal()
     try:
         concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
         if not concept: return
-
-        pages = db.query(models.PdfPage).filter(
-            models.PdfPage.pdf_id == concept.pdf_id,
-            models.PdfPage.page_number >= concept.start_page,
-            models.PdfPage.page_number <= concept.end_page
-        ).order_by(models.PdfPage.page_number).all()
-
+        pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == concept.pdf_id, models.PdfPage.page_number >= concept.start_page, models.PdfPage.page_number <= concept.end_page).order_by(models.PdfPage.page_number).all()
         concept_text = "\n".join([p.page_text for p in pages if p.page_text])
-        
         if not concept_text: return
-
-        # 퀴즈 생성 (기본 3문제)
-        quiz_response = quiz.generate_quizzes(concept.title, concept_text, num_quizzes=3)
-
-        for q in quiz_response.quizzes:
-            new_quiz = models.AiGeneratedQuiz(
-                quiz_id=uuid.uuid4(),
-                room_id=room_id,
-                concept_id=concept_id,
-                question=q.question,
-                choices=q.choices,
-                correct_answer=q.correct_answer,
-                explanation=q.explanation
-            )
-            db.add(new_quiz)
         
+        quiz_response = quiz.generate_quizzes(concept.title, concept_text, num_quizzes=2)
+        for q in quiz_response.quizzes:
+            new_quiz = models.AiGeneratedQuiz(quiz_id=uuid.uuid4(), room_id=room_id, concept_id=concept_id, question=q.question, choices=q.choices, correct_answer=q.correct_answer, explanation=q.explanation)
+            db.add(new_quiz)
         db.commit()
         print(f"Quizzes generated for concept {concept.title}")
-
     except Exception as e:
         print(f"Error in quiz generation: {e}")
     finally:
         db.close()
 
+# --- API Endpoints ---
 @app.get("/")
-def read_root():
-    return {"message": "kim-teacher-platform backend is running"}
+def read_root(): return {"message": "kim-teacher-platform backend is running"}
 
-@app.get("/db-check")
-def db_check(db: Session = Depends(get_db)):
-    try:
-        result = db.execute(text("SELECT 1"))
-        return {"status": "success", "message": "DB Connected!", "result": result.scalar()}
-    except Exception as e:
-        return {"status": "fail", "error": str(e)}
-
-# --- [NEW] 로그인 API ---
 @app.post("/login")
 def login(request: schemas.LoginRequest, db: Session = Depends(get_db)):
     user = db.query(models.UserAccount).filter(models.UserAccount.email == request.email).first()
+    if not user or user.password_hash != request.password:
+        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 틀렸습니다.")
+    return {"message": "로그인 성공", "user_id": str(user.user_id), "nickname": user.nickname}
 
-    if not user:
-        raise HTTPException(status_code=401, detail="존재하지 않는 이메일입니다.")
-    
-    if user.password_hash != request.password:
-        raise HTTPException(status_code=401, detail="비밀번호가 틀렸습니다.")
-
-    return {
-        "message": "로그인 성공", 
-        "user_id": str(user.user_id),
-        "nickname": user.nickname
-    }
-
-# --- 1. PDF 업로드 ---
 @app.post("/pdf/upload", response_model=schemas.PdfUploadResponse)
 async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)):
     user = get_or_create_test_user(db)
     content = await file.read()
     pdf_reader = PdfReader(io.BytesIO(content))
-    total_pages = len(pdf_reader.pages)
-
-    pdf = models.Pdf(
-        pdf_id=uuid.uuid4(),
-        user_id=user.user_id,
-        file_name=file.filename,
-        storage_url="local_storage"
-    )
+    pdf = models.Pdf(pdf_id=uuid.uuid4(), user_id=user.user_id, file_name=file.filename)
     db.add(pdf)
     db.commit()
     db.refresh(pdf)
-
-    pages_to_save = []
-    for i, page in enumerate(pdf_reader.pages):
-        new_page = models.PdfPage(
-            page_id=uuid.uuid4(),
-            pdf_id=pdf.pdf_id,
-            page_number=i + 1,
-            page_text=page.extract_text() or ""
-        )
-        pages_to_save.append(new_page)
-    
+    pages_to_save = [models.PdfPage(page_id=uuid.uuid4(), pdf_id=pdf.pdf_id, page_number=i + 1, page_text=page.extract_text() or "") for i, page in enumerate(pdf_reader.pages)]
     db.add_all(pages_to_save)
     db.commit()
+    return {"pdf_id": pdf.pdf_id, "file_name": pdf.file_name, "total_pages": len(pages_to_save), "message": "PDF uploaded."}
 
-    return {
-        "pdf_id": pdf.pdf_id,
-        "file_name": pdf.file_name,
-        "total_pages": total_pages,
-        "message": "PDF uploaded and pages saved successfully."
-    }
-
-# --- 2. 학습방 생성 ---
 @app.post("/learning-rooms", response_model=schemas.LearningRoomResponse, status_code=201)
 def create_learning_room(room_data: schemas.LearningRoomCreate, db: Session = Depends(get_db)):
     user = get_or_create_test_user(db)
-    
-    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == room_data.pdf_id).first()
-    if not pdf:
+    if not db.query(models.Pdf).filter(models.Pdf.pdf_id == room_data.pdf_id).first():
         raise HTTPException(status_code=404, detail="PDF not found")
-
-    new_room = models.LearningRoom(
-        room_id=uuid.uuid4(),
-        user_id=user.user_id,
-        pdf_id=room_data.pdf_id,
-        study_goal=room_data.study_goal
-    )
+    new_room = models.LearningRoom(room_id=uuid.uuid4(), user_id=user.user_id, pdf_id=room_data.pdf_id, study_goal=room_data.study_goal)
     db.add(new_room)
     db.commit()
     db.refresh(new_room)
-
     return new_room
 
-# --- 3. 문서 구조 분석 요청 (개념 추출) ---
 @app.post("/pdf/{pdf_id}/structure", response_model=schemas.StructureAnalysisResponse)
 def analyze_structure(pdf_id: uuid.UUID, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
-    if not pdf: raise HTTPException(status_code=404, detail="PDF not found")
-
+    if not db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first():
+        raise HTTPException(status_code=404, detail="PDF not found")
     background_tasks.add_task(process_document_structure, pdf_id)
+    return {"pdf_id": pdf_id, "message": "Document structure analysis started."}
 
-    return {
-        "pdf_id": pdf.pdf_id,
-        "message": "Document structure analysis started. Concepts will be extracted."
-    }
-
-# --- 4. 개념별 튜터링 스크립트 생성 요청 ---
-@app.post("/concepts/{concept_id}/lecture", response_model=schemas.AnalysisResponse)
-def generate_lecture(concept_id: uuid.UUID, request: schemas.AnalysisRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
-    if not concept: raise HTTPException(status_code=404, detail="Concept not found")
-
-    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first()
-    if not room: raise HTTPException(status_code=404, detail="Room not found")
-
-    background_tasks.add_task(process_lecture_generation, concept_id, request.room_id)
-
-    return {
-        "pdf_id": concept.pdf_id,
-        "room_id": request.room_id,
-        "message": "Lecture script generation started in background."
-    }
-
-# --- 5. 개념별 퀴즈 생성 요청 ---
-@app.post("/concepts/{concept_id}/quiz", response_model=schemas.AnalysisResponse)
-def generate_quiz(concept_id: uuid.UUID, request: schemas.AnalysisRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
-    if not concept: raise HTTPException(status_code=404, detail="Concept not found")
-
-    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first()
-    if not room: raise HTTPException(status_code=404, detail="Room not found")
-
-    background_tasks.add_task(process_quiz_generation, concept_id, request.room_id)
-
-    return {
-        "pdf_id": concept.pdf_id,
-        "room_id": request.room_id,
-        "message": "Quiz generation started in background."
-    }
-
-# --- 6. 분석 결과 조회 ---
-@app.get("/pdf/{pdf_id}/pages", response_model=schemas.PdfPagesDetailResponse)
-def get_pdf_pages_detail(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
-    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
-    if not pdf: raise HTTPException(status_code=404, detail="PDF not found")
-
-    pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == pdf_id).order_by(models.PdfPage.page_number).all()
-
-    return {
-        "pdf_id": pdf.pdf_id,
-        "file_name": pdf.file_name,
-        "pages": pages
-    }
-
-# --- 7. 개념 목록 조회 API ---
 @app.get("/pdf/{pdf_id}/concepts", response_model=schemas.ConceptListResponse)
 def get_pdf_concepts(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
     pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
     if not pdf: raise HTTPException(status_code=404, detail="PDF not found")
-
     concepts = db.query(models.Concept).filter(models.Concept.pdf_id == pdf_id).order_by(models.Concept.order_index).all()
+    if not concepts: raise HTTPException(status_code=404, detail="Concepts not found for this PDF. Please run structure analysis first.")
+    return {"pdf_id": pdf_id, "concepts": concepts}
 
-    return {
-        "pdf_id": pdf.pdf_id,
-        "concepts": concepts
-    }
+@app.get("/pdf/{pdf_id}/pages", response_model=schemas.PdfPagesDetailResponse)
+def get_pdf_pages_detail(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
+    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
+    if not pdf: raise HTTPException(status_code=404, detail="PDF not found")
+    pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == pdf_id).order_by(models.PdfPage.page_number).all()
+    return {"pdf_id": pdf.pdf_id, "file_name": pdf.file_name, "pages": pages}
 
-# --- 8. [NEW] 퀴즈 목록 조회 (풀이용) ---
+@app.post("/concepts/{concept_id}/lecture", response_model=schemas.AnalysisResponse)
+def generate_lecture(concept_id: uuid.UUID, request: schemas.AnalysisRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
+    if not concept: raise HTTPException(status_code=404, detail="Concept not found")
+    if not db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first():
+        raise HTTPException(status_code=404, detail="Room not found")
+    background_tasks.add_task(process_lecture_generation, concept_id, request.room_id)
+    return {"pdf_id": concept.pdf_id, "room_id": request.room_id, "message": "Lecture script generation started."}
+
+@app.post("/concepts/{concept_id}/quiz", response_model=schemas.AnalysisResponse)
+def generate_quiz(concept_id: uuid.UUID, request: schemas.AnalysisRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
+    if not concept: raise HTTPException(status_code=404, detail="Concept not found")
+    if not db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first():
+        raise HTTPException(status_code=404, detail="Room not found")
+    background_tasks.add_task(process_quiz_generation, concept_id, request.room_id)
+    return {"pdf_id": concept.pdf_id, "room_id": request.room_id, "message": "Quiz generation started."}
+
 @app.get("/concepts/{concept_id}/quizzes", response_model=schemas.QuizListResponse)
 def get_concept_quizzes(concept_id: uuid.UUID, db: Session = Depends(get_db)):
     quizzes = db.query(models.AiGeneratedQuiz).filter(models.AiGeneratedQuiz.concept_id == concept_id).all()
-    
-    return {
-        "concept_id": concept_id,
-        "quizzes": quizzes
-    }
+    return {"concept_id": concept_id, "quizzes": quizzes}
 
-# --- 9. [NEW] 퀴즈 답안 제출 및 채점 ---
 @app.post("/quizzes/submit", response_model=schemas.QuizResultResponse)
 def submit_quiz(submission: schemas.QuizSubmission, db: Session = Depends(get_db)):
     room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == submission.room_id).first()
     if not room: raise HTTPException(status_code=404, detail="Room not found")
 
-    total_questions = len(submission.answers)
-    score = 0
-    wrong_answers_to_save = []
-    quiz_ids = []
+    score, total_questions, wrong_answers_to_save, quiz_ids = 0, len(submission.answers), [], []
+    concept_results = {}
 
     for answer in submission.answers:
         quiz = db.query(models.AiGeneratedQuiz).filter(models.AiGeneratedQuiz.quiz_id == answer.quiz_id).first()
         if not quiz: continue
         
         quiz_ids.append(quiz.quiz_id)
-
-        # 정답 비교 (대소문자 무시, 공백 제거 등 유연하게 처리)
         is_correct = quiz.correct_answer.strip().lower() == answer.selected_answer.strip().lower()
         
+        if quiz.concept_id not in concept_results:
+            concept_results[quiz.concept_id] = {'correct': 0, 'total': 0, 'total_time': 0}
+        
+        concept_results[quiz.concept_id]['total'] += 1
+        concept_results[quiz.concept_id]['total_time'] += answer.solve_time_seconds
         if is_correct:
             score += 1
+            concept_results[quiz.concept_id]['correct'] += 1
         else:
-            # 오답 노트 생성
-            wrong_answer = models.WrongAnswer(
-                wrong_id=uuid.uuid4(),
-                # quiz_history_id는 아래에서 생성 후 연결
-                question=quiz.question,
-                your_answer=answer.selected_answer,
-                correct_answer=quiz.correct_answer,
-                explanation=quiz.explanation
-            )
-            wrong_answers_to_save.append(wrong_answer)
+            wrong_answers_to_save.append(models.WrongAnswer(wrong_id=uuid.uuid4(), question=quiz.question, your_answer=answer.selected_answer, correct_answer=quiz.correct_answer, explanation=quiz.explanation))
 
-    # 퀴즈 풀이 기록 저장
-    history = models.QuizHistory(
-        quiz_history_id=uuid.uuid4(),
-        room_id=submission.room_id,
-        generated_quiz_ids=quiz_ids,
-        score=score,
-        total_questions=total_questions,
-        duration_seconds=submission.duration_seconds
-    )
+    history = models.QuizHistory(quiz_history_id=uuid.uuid4(), room_id=submission.room_id, generated_quiz_ids=quiz_ids, score=score, total_questions=total_questions, duration_seconds=sum(a.solve_time_seconds for a in submission.answers))
     db.add(history)
-    db.commit() # history ID 생성을 위해 커밋
+    db.commit()
 
-    # 오답 노트에 history_id 연결 및 저장
     for wa in wrong_answers_to_save:
         wa.quiz_history_id = history.quiz_history_id
         db.add(wa)
+
+    updated_mastery_list = []
+    for concept_id, results in concept_results.items():
+        mastery = db.query(models.ConceptMastery).filter_by(room_id=submission.room_id, concept_id=concept_id).first()
+        if not mastery:
+            mastery = models.ConceptMastery(mastery_id=uuid.uuid4(), room_id=submission.room_id, concept_id=concept_id, retry_count=0, avg_solve_time=0.0)
+            db.add(mastery)
+        
+        mastery.retry_count += 1
+        mastery.last_accuracy = (results['correct'] / results['total']) * 100
+        mastery.avg_solve_time = ((mastery.avg_solve_time * (mastery.retry_count - 1)) + results['total_time']) / mastery.retry_count
+        mastery.mastery_state = analytics_engine.classify_concept_state(mastery.last_accuracy, mastery.avg_solve_time, mastery.retry_count)
+        updated_mastery_list.append({"concept_id": concept_id, "new_state": mastery.mastery_state})
+
+    db.commit()
     
+    return {"quiz_history_id": history.quiz_history_id, "score": score, "total_questions": total_questions, "wrong_answers": wrong_answers_to_save, "updated_mastery": updated_mastery_list}
+
+# --- [NEW] 개념 기반 Q&A API ---
+@app.post("/concepts/{concept_id}/qna", response_model=schemas.QnAResponse)
+def ask_question(concept_id: uuid.UUID, request: schemas.QnARequest, db: Session = Depends(get_db)):
+    user = get_or_create_test_user(db) # 실제로는 로그인된 유저 사용
+    concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
+    if not concept: raise HTTPException(status_code=404, detail="Concept not found")
+
+    # 1. 개념 텍스트(Context) 수집
+    pages = db.query(models.PdfPage).filter(
+        models.PdfPage.pdf_id == concept.pdf_id,
+        models.PdfPage.page_number >= concept.start_page,
+        models.PdfPage.page_number <= concept.end_page
+    ).order_by(models.PdfPage.page_number).all()
+    concept_text = "\n".join([p.page_text for p in pages if p.page_text])
+
+    # 2. 사용자 질문 로그 저장
+    user_log = models.StudyChatLog(log_id=uuid.uuid4(), room_id=request.room_id, user_id=user.user_id, role="user", message=request.question)
+    db.add(user_log)
     db.commit()
 
-    # 결과 반환
+    # 3. AI 답변 생성 (가드레일 적용)
+    answer_text = qna.generate_answer(concept_text, request.question)
+
+    # 4. AI 답변 로그 저장
+    ai_log = models.StudyChatLog(log_id=uuid.uuid4(), room_id=request.room_id, user_id=None, role="assistant", message=answer_text)
+    db.add(ai_log)
+    db.commit()
+    db.refresh(ai_log)
+
+    return {"answer": answer_text, "log_id": ai_log.log_id}
+
+@app.get("/learning-rooms/{room_id}/progress", response_model=schemas.ProgressResponse)
+def get_progress(room_id: uuid.UUID, db: Session = Depends(get_db)):
+    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == room_id).first()
+    if not room: raise HTTPException(status_code=404, detail="Room not found")
+    total_pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == room.pdf_id).count()
+    progress_percentage = (room.current_page / total_pages * 100) if total_pages > 0 else 0
+    return {"room_id": room.room_id, "current_page": room.current_page, "total_pages": total_pages, "progress_percentage": round(progress_percentage, 1), "last_study_date": room.last_study_date}
+
+@app.post("/learning-rooms/{room_id}/progress", response_model=schemas.ProgressResponse)
+def update_progress(room_id: uuid.UUID, update_data: schemas.ProgressUpdate, db: Session = Depends(get_db)):
+    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == room_id).first()
+    if not room: raise HTTPException(status_code=404, detail="Room not found")
+    room.current_page = update_data.current_page
+    room.last_study_date = datetime.now()
+    db.commit()
+    db.refresh(room)
+    return get_progress(room_id, db)
+
+@app.get("/learning-rooms/{room_id}/statistics", response_model=schemas.StudyStatisticsResponse)
+def get_study_statistics(room_id: uuid.UUID, db: Session = Depends(get_db)):
+    if not db.query(models.LearningRoom).filter(models.LearningRoom.room_id == room_id).first():
+        raise HTTPException(status_code=404, detail="Room not found")
+    histories = db.query(models.QuizHistory).filter(models.QuizHistory.room_id == room_id).all()
+    total_questions = sum(h.total_questions for h in histories)
+    total_correct = sum(h.score for h in histories)
     return {
-        "quiz_history_id": history.quiz_history_id,
-        "score": score,
-        "total_questions": total_questions,
-        "wrong_answers": [
-            {
-                "question": wa.question,
-                "your_answer": wa.your_answer,
-                "correct_answer": wa.correct_answer,
-                "explanation": wa.explanation
-            } for wa in wrong_answers_to_save
-        ]
+        "total_quizzes_taken": len(histories),
+        "total_questions_solved": total_questions,
+        "total_correct_answers": total_correct,
+        "average_score": (total_correct / len(histories)) if histories else 0.0,
+        "accuracy_rate": (total_correct / total_questions * 100) if total_questions > 0 else 0.0,
+        "total_study_time_seconds": sum(h.duration_seconds for h in histories)
+    }
+
+@app.get("/learning-rooms/{room_id}/weaknesses", response_model=schemas.WeaknessAnalysisResponse)
+def get_weaknesses(room_id: uuid.UUID, db: Session = Depends(get_db)):
+    if not db.query(models.LearningRoom).filter(models.LearningRoom.room_id == room_id).first():
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    weak_masteries = db.query(models.ConceptMastery).filter(
+        models.ConceptMastery.room_id == room_id,
+        models.ConceptMastery.mastery_state.in_(['struggling', 'careless', 'unstable'])
+    ).all()
+
+    weak_concepts_info = []
+    for mastery in weak_masteries:
+        concept = db.query(models.Concept).filter(models.Concept.concept_id == mastery.concept_id).first()
+        if concept:
+            weak_concepts_info.append({
+                "concept_id": mastery.concept_id,
+                "title": concept.title,
+                "mastery_state": mastery.mastery_state,
+                "wrong_count": mastery.retry_count
+            })
+
+    return {
+        "room_id": room_id,
+        "weak_concepts": weak_concepts_info,
+        "message": "Weakness analysis based on mastery state."
     }

@@ -1,7 +1,7 @@
 from . import guard
 from .. import schemas
 
-def generate_quizzes(concept_title: str, concept_text: str, num_quizzes: int = 3) -> schemas.QuizGenerationResponse:
+def generate_quizzes(concept_title: str, concept_text: str, num_quizzes: int = 2) -> schemas.QuizGenerationResponse: # 3 -> 2로 변경
     """
     주어진 개념 텍스트를 기반으로 4지 선다형 퀴즈를 생성합니다.
     """
