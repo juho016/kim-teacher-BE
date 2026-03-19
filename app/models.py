@@ -11,10 +11,10 @@ class UserAccount(Base):
     email = Column(String(255), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     nickname = Column(String(100))
-
+    
     pdfs = relationship("Pdf", back_populates="user")
     learning_rooms = relationship("LearningRoom", back_populates="user")
-    # chat_logs = relationship("StudyChatLog", back_populates="user") # 순환 참조 문제로 잠시 주석 처리
+    chat_logs = relationship("StudyChatLog", back_populates="user")
 
 class Pdf(Base):
     __tablename__ = 'pdf'
@@ -56,8 +56,9 @@ class LearningRoom(Base):
     quizzes = relationship("AiGeneratedQuiz", back_populates="room")
     quiz_histories = relationship("QuizHistory", back_populates="room")
     mastery_levels = relationship("ConceptMastery", back_populates="room")
+    chat_logs = relationship("StudyChatLog", back_populates="room")
     weakness_diagnoses = relationship("WeaknessDiagnosis", back_populates="room")
-    # chat_logs = relationship("StudyChatLog", back_populates="room") # 순환 참조 문제로 잠시 주석 처리
+    cornell_notes = relationship("CornellNote", back_populates="room") # 추가
 
 class PdfExtractionPage(Base):
     __tablename__ = 'pdf_extraction_page'
@@ -87,10 +88,11 @@ class Concept(Base):
     hierarchy_level = Column(Integer, nullable=False, default=0)
     parent_concept_id = Column(UUID(as_uuid=True), ForeignKey('concept.concept_id'), nullable=True)
     path_text = Column(Text, nullable=True)
-
+    
     parent_concept = relationship("Concept", remote_side=[concept_id], backref="child_concepts")
     pdf = relationship("Pdf", back_populates="concepts")
     mastery_levels = relationship("ConceptMastery", back_populates="concept")
+    cornell_notes = relationship("CornellNote", back_populates="concept") # 추가
 
 class AiTutorScript(Base):
     __tablename__ = 'ai_tutor_script'
@@ -167,8 +169,8 @@ class StudyChatLog(Base):
     message = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # room = relationship("LearningRoom", back_populates="chat_logs")
-    # user = relationship("UserAccount", back_populates="chat_logs")
+    room = relationship("LearningRoom", back_populates="chat_logs")
+    user = relationship("UserAccount", back_populates="chat_logs")
 
 class WeaknessDiagnosis(Base):
     __tablename__ = 'weakness_diagnosis'
@@ -180,36 +182,19 @@ class WeaknessDiagnosis(Base):
 
     room = relationship("LearningRoom", back_populates="weakness_diagnoses")
 
-class Pdfs(Base): # 레거시 테이블 (사용 안 함)
-    __tablename__ = "pdfs"
-    id = Column(Integer, primary_key=True, index=True)
-    file_name = Column(String, nullable=False)
-    total_pages = Column(Integer, default=0)
+# --- [NEW] 코넬 노트 테이블 ---
+class CornellNote(Base):
+    __tablename__ = 'cornell_note'
+    note_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    room_id = Column(UUID(as_uuid=True), ForeignKey('learning_room.room_id'), nullable=False)
+    concept_id = Column(UUID(as_uuid=True), ForeignKey('concept.concept_id'), nullable=False)
+    
+    keywords = Column(JSON, nullable=True) # 왼쪽 (Cue) 영역: ["키워드1", "질문1", ...]
+    notes = Column(Text, nullable=True)    # 오른쪽 (Notes) 영역: 메인 필기 내용
+    summary = Column(Text, nullable=True)  # 하단 (Summary) 영역: 요약
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-class Pages(Base): # 레거시 테이블 (사용 안 함)
-    __tablename__ = "pages"
-    id = Column(Integer, primary_key=True, index=True)
-    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
-    page_number = Column(Integer, nullable=False)
-    text_content = Column(Text, nullable=True)
-    image_url = Column(String, nullable=True)
-
-class StudyProgress(Base): # 레거시 테이블 (사용 안 함)
-    __tablename__ = "study_progress"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True)
-    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
-    current_page = Column(Integer, default=1)
-    last_study_date = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    is_completed = Column(Boolean, default=False)
-
-class StudyLog(Base): # 레거시 테이블 (사용 안 함)
-    __tablename__ = "study_logs"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True)
-    pdf_id = Column(Integer, ForeignKey("pdfs.id"))
-    page_id = Column(Integer, ForeignKey("pages.id"), nullable=True)
-    action = Column(String, nullable=False)
-    stay_time = Column(Integer, default=0)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    room = relationship("LearningRoom", back_populates="cornell_notes")
+    concept = relationship("Concept", back_populates="cornell_notes")

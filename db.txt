@@ -1,0 +1,403 @@
+CREATE SCHEMA public AUTHORIZATION pg_database_owner;
+
+COMMENT ON SCHEMA public IS 'standard public schema';
+
+-- DROP SEQUENCE public.pages_id_seq;
+
+CREATE SEQUENCE public.pages_id_seq
+	INCREMENT BY 1
+	MINVALUE 1
+	MAXVALUE 2147483647
+	START 1
+	CACHE 1
+	NO CYCLE;
+-- DROP SEQUENCE public.pdfs_id_seq;
+
+CREATE SEQUENCE public.pdfs_id_seq
+	INCREMENT BY 1
+	MINVALUE 1
+	MAXVALUE 2147483647
+	START 1
+	CACHE 1
+	NO CYCLE;
+-- DROP SEQUENCE public.study_logs_id_seq;
+
+CREATE SEQUENCE public.study_logs_id_seq
+	INCREMENT BY 1
+	MINVALUE 1
+	MAXVALUE 2147483647
+	START 1
+	CACHE 1
+	NO CYCLE;
+-- DROP SEQUENCE public.study_progress_id_seq;
+
+CREATE SEQUENCE public.study_progress_id_seq
+	INCREMENT BY 1
+	MINVALUE 1
+	MAXVALUE 2147483647
+	START 1
+	CACHE 1
+	NO CYCLE;-- public.pdfs definition
+
+-- Drop table
+
+-- DROP TABLE public.pdfs;
+
+CREATE TABLE public.pdfs (
+	id serial4 NOT NULL,
+	file_name varchar NOT NULL,
+	total_pages int4 NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	CONSTRAINT pdfs_pkey PRIMARY KEY (id)
+);
+CREATE INDEX ix_pdfs_id ON public.pdfs USING btree (id);
+
+
+-- public.user_account definition
+
+-- Drop table
+
+-- DROP TABLE public.user_account;
+
+CREATE TABLE public.user_account (
+	user_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	email varchar(255) NOT NULL,
+	password_hash varchar(255) NOT NULL,
+	nickname varchar(100) NULL,
+	registration_date timestamptz DEFAULT now() NOT NULL,
+	CONSTRAINT user_account_email_key UNIQUE (email),
+	CONSTRAINT user_account_pkey PRIMARY KEY (user_id)
+);
+
+
+-- public.pages definition
+
+-- Drop table
+
+-- DROP TABLE public.pages;
+
+CREATE TABLE public.pages (
+	id serial4 NOT NULL,
+	pdf_id int4 NULL,
+	page_number int4 NOT NULL,
+	text_content text NULL,
+	image_url varchar NULL,
+	CONSTRAINT pages_pkey PRIMARY KEY (id),
+	CONSTRAINT pages_pdf_id_fkey FOREIGN KEY (pdf_id) REFERENCES public.pdfs(id)
+);
+CREATE INDEX ix_pages_id ON public.pages USING btree (id);
+
+
+-- public.pdf definition
+
+-- Drop table
+
+-- DROP TABLE public.pdf;
+
+CREATE TABLE public.pdf (
+	pdf_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	user_id uuid NOT NULL,
+	file_name varchar(255) NOT NULL,
+	storage_url text NULL,
+	upload_date timestamptz DEFAULT now() NOT NULL,
+	CONSTRAINT pdf_pkey PRIMARY KEY (pdf_id),
+	CONSTRAINT pdf_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_account(user_id) ON DELETE CASCADE
+);
+
+
+-- public.pdf_page definition
+
+-- Drop table
+
+-- DROP TABLE public.pdf_page;
+
+CREATE TABLE public.pdf_page (
+	page_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	pdf_id uuid NOT NULL,
+	page_number int4 NOT NULL,
+	page_text text NULL,
+	thumbnail_url text NULL,
+	CONSTRAINT pdf_page_pkey PRIMARY KEY (page_id),
+	CONSTRAINT pdf_page_pdf_id_fkey FOREIGN KEY (pdf_id) REFERENCES public.pdf(pdf_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_pdf_page_pdf_id_page_number ON public.pdf_page USING btree (pdf_id, page_number);
+
+
+-- public.study_logs definition
+
+-- Drop table
+
+-- DROP TABLE public.study_logs;
+
+CREATE TABLE public.study_logs (
+	id serial4 NOT NULL,
+	user_id varchar NULL,
+	pdf_id int4 NULL,
+	page_id int4 NULL,
+	"action" varchar NOT NULL,
+	stay_time int4 NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	CONSTRAINT study_logs_pkey PRIMARY KEY (id),
+	CONSTRAINT study_logs_page_id_fkey FOREIGN KEY (page_id) REFERENCES public.pages(id),
+	CONSTRAINT study_logs_pdf_id_fkey FOREIGN KEY (pdf_id) REFERENCES public.pdfs(id)
+);
+CREATE INDEX ix_study_logs_id ON public.study_logs USING btree (id);
+CREATE INDEX ix_study_logs_user_id ON public.study_logs USING btree (user_id);
+
+
+-- public.study_progress definition
+
+-- Drop table
+
+-- DROP TABLE public.study_progress;
+
+CREATE TABLE public.study_progress (
+	id serial4 NOT NULL,
+	user_id varchar NULL,
+	pdf_id int4 NULL,
+	current_page int4 NULL,
+	last_study_date timestamptz DEFAULT now() NULL,
+	is_completed bool NULL,
+	CONSTRAINT study_progress_pkey PRIMARY KEY (id),
+	CONSTRAINT study_progress_pdf_id_fkey FOREIGN KEY (pdf_id) REFERENCES public.pdfs(id)
+);
+CREATE INDEX ix_study_progress_id ON public.study_progress USING btree (id);
+CREATE INDEX ix_study_progress_user_id ON public.study_progress USING btree (user_id);
+
+
+-- public.concept definition
+
+-- Drop table
+
+-- DROP TABLE public.concept;
+
+CREATE TABLE public.concept (
+	concept_id uuid NOT NULL, -- 개념 고유 ID(UUID)
+	pdf_id uuid NOT NULL, -- 이 개념이 속한 PDF의 고유 ID
+	title varchar(255) NOT NULL, -- 개념 제목
+	description text NULL, -- 개념에 대한 짧은 설명
+	start_page int4 NOT NULL, -- 개념이 시작되는 PDF 페이지 번호
+	end_page int4 NOT NULL, -- 개념이 끝나는 PDF 페이지 번호
+	order_index int4 NOT NULL, -- 같은 PDF 또는 같은 부모 개념 아래에서 표시 순서
+	concept_type varchar(30) NULL, -- 개념 유형(intro, section, concept, subconcept, example, summary)
+	hierarchy_level int4 DEFAULT 0 NOT NULL, -- 문서 구조상 깊이 수준(0=최상위, 1=하위, 2=더 하위...)
+	parent_concept_id uuid NULL, -- 상위 개념의 ID, 최상위 개념이면 NULL
+	path_text text NULL, -- 개념의 전체 경로 문자열 예: 협업 필터링 > 메모리 기반 CF > User-based CF
+	CONSTRAINT chk_concept_hierarchy_level CHECK ((hierarchy_level >= 0)),
+	CONSTRAINT chk_concept_page_range CHECK ((start_page <= end_page)),
+	CONSTRAINT chk_concept_type CHECK (((concept_type IS NULL) OR ((concept_type)::text = ANY ((ARRAY['intro'::character varying, 'section'::character varying, 'concept'::character varying, 'subconcept'::character varying, 'example'::character varying, 'summary'::character varying])::text[])))),
+	CONSTRAINT concept_pkey PRIMARY KEY (concept_id),
+	CONSTRAINT concept_pdf_id_fkey FOREIGN KEY (pdf_id) REFERENCES public.pdf(pdf_id),
+	CONSTRAINT fk_concept_parent FOREIGN KEY (parent_concept_id) REFERENCES public.concept(concept_id) ON DELETE SET NULL
+);
+COMMENT ON TABLE public.concept IS 'PDF 구조 분석 결과에서 추출된 개념 정보를 저장하는 테이블';
+
+-- Column comments
+
+COMMENT ON COLUMN public.concept.concept_id IS '개념 고유 ID(UUID)';
+COMMENT ON COLUMN public.concept.pdf_id IS '이 개념이 속한 PDF의 고유 ID';
+COMMENT ON COLUMN public.concept.title IS '개념 제목';
+COMMENT ON COLUMN public.concept.description IS '개념에 대한 짧은 설명';
+COMMENT ON COLUMN public.concept.start_page IS '개념이 시작되는 PDF 페이지 번호';
+COMMENT ON COLUMN public.concept.end_page IS '개념이 끝나는 PDF 페이지 번호';
+COMMENT ON COLUMN public.concept.order_index IS '같은 PDF 또는 같은 부모 개념 아래에서 표시 순서';
+COMMENT ON COLUMN public.concept.concept_type IS '개념 유형(intro, section, concept, subconcept, example, summary)';
+COMMENT ON COLUMN public.concept.hierarchy_level IS '문서 구조상 깊이 수준(0=최상위, 1=하위, 2=더 하위...)';
+COMMENT ON COLUMN public.concept.parent_concept_id IS '상위 개념의 ID, 최상위 개념이면 NULL';
+COMMENT ON COLUMN public.concept.path_text IS '개념의 전체 경로 문자열 예: 협업 필터링 > 메모리 기반 CF > User-based CF';
+
+-- Constraint comments
+
+COMMENT ON CONSTRAINT chk_concept_hierarchy_level ON public.concept IS '계층 레벨은 0 이상만 허용';
+COMMENT ON CONSTRAINT chk_concept_page_range ON public.concept IS '시작 페이지가 종료 페이지보다 클 수 없도록 제한';
+COMMENT ON CONSTRAINT chk_concept_type ON public.concept IS '허용된 개념 유형만 저장되도록 제한';
+COMMENT ON CONSTRAINT fk_concept_parent ON public.concept IS '상위 개념을 같은 concept 테이블에서 참조하는 자기참조 외래키';
+
+
+-- public.learning_room definition
+
+-- Drop table
+
+-- DROP TABLE public.learning_room;
+
+CREATE TABLE public.learning_room (
+	room_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	user_id uuid NOT NULL,
+	pdf_id uuid NOT NULL,
+	current_page int4 DEFAULT 1 NULL,
+	last_study_date timestamptz DEFAULT now() NULL,
+	study_goal text NULL,
+	CONSTRAINT learning_room_pkey PRIMARY KEY (room_id),
+	CONSTRAINT learning_room_pdf_id_fkey FOREIGN KEY (pdf_id) REFERENCES public.pdf(pdf_id) ON DELETE CASCADE,
+	CONSTRAINT learning_room_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_account(user_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_learning_room_pdf_id ON public.learning_room USING btree (pdf_id);
+CREATE INDEX idx_learning_room_user_id ON public.learning_room USING btree (user_id);
+
+
+-- public.pdf_extraction_page definition
+
+-- Drop table
+
+-- DROP TABLE public.pdf_extraction_page;
+
+CREATE TABLE public.pdf_extraction_page (
+	pdf_extraction_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	room_id uuid NOT NULL,
+	page_id uuid NOT NULL,
+	pdf_id uuid NOT NULL,
+	summary text NULL,
+	cornell_summary text NULL,
+	key_terms jsonb NULL,
+	concept_json jsonb NULL,
+	last_updated timestamptz DEFAULT now() NOT NULL,
+	CONSTRAINT pdf_extraction_page_pkey PRIMARY KEY (pdf_extraction_id),
+	CONSTRAINT pdf_extraction_page_page_id_fkey FOREIGN KEY (page_id) REFERENCES public.pdf_page(page_id) ON DELETE CASCADE,
+	CONSTRAINT pdf_extraction_page_pdf_id_fkey FOREIGN KEY (pdf_id) REFERENCES public.pdf(pdf_id) ON DELETE CASCADE,
+	CONSTRAINT pdf_extraction_page_room_id_fkey FOREIGN KEY (room_id) REFERENCES public.learning_room(room_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_pdf_extraction_room_page ON public.pdf_extraction_page USING btree (room_id, page_id);
+
+
+-- public.quiz_history definition
+
+-- Drop table
+
+-- DROP TABLE public.quiz_history;
+
+CREATE TABLE public.quiz_history (
+	quiz_history_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	room_id uuid NOT NULL,
+	generated_quiz_ids _uuid NULL,
+	score int4 NULL,
+	total_questions int4 NULL,
+	start_time timestamptz DEFAULT now() NOT NULL,
+	duration_seconds int4 NULL,
+	CONSTRAINT quiz_history_pkey PRIMARY KEY (quiz_history_id),
+	CONSTRAINT quiz_history_room_id_fkey FOREIGN KEY (room_id) REFERENCES public.learning_room(room_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_quiz_history_room_id ON public.quiz_history USING btree (room_id);
+
+
+-- public.study_chat_log definition
+
+-- Drop table
+
+-- DROP TABLE public.study_chat_log;
+
+CREATE TABLE public.study_chat_log (
+	log_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	room_id uuid NOT NULL,
+	user_id uuid NULL,
+	"role" varchar(20) NOT NULL,
+	message text NOT NULL,
+	created_at timestamptz DEFAULT now() NOT NULL,
+	CONSTRAINT study_chat_log_pkey PRIMARY KEY (log_id),
+	CONSTRAINT study_chat_log_room_id_fkey FOREIGN KEY (room_id) REFERENCES public.learning_room(room_id) ON DELETE CASCADE,
+	CONSTRAINT study_chat_log_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_account(user_id) ON DELETE SET NULL
+);
+CREATE INDEX idx_chat_room_created_at ON public.study_chat_log USING btree (room_id, created_at);
+
+
+-- public.weakness_diagnosis definition
+
+-- Drop table
+
+-- DROP TABLE public.weakness_diagnosis;
+
+CREATE TABLE public.weakness_diagnosis (
+	diagnosis_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	room_id uuid NOT NULL,
+	analysis_date timestamptz DEFAULT now() NOT NULL,
+	weak_area text NULL,
+	improvement_plan text NULL,
+	CONSTRAINT weakness_diagnosis_pkey PRIMARY KEY (diagnosis_id),
+	CONSTRAINT weakness_diagnosis_room_id_fkey FOREIGN KEY (room_id) REFERENCES public.learning_room(room_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_weakness_room_id ON public.weakness_diagnosis USING btree (room_id);
+
+
+-- public.wrong_answer definition
+
+-- Drop table
+
+-- DROP TABLE public.wrong_answer;
+
+CREATE TABLE public.wrong_answer (
+	wrong_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	quiz_history_id uuid NOT NULL,
+	question text NOT NULL,
+	your_answer text NULL,
+	correct_answer text NULL,
+	explanation text NULL,
+	review_count int4 DEFAULT 0 NOT NULL,
+	is_mastered bool DEFAULT false NOT NULL,
+	CONSTRAINT wrong_answer_pkey PRIMARY KEY (wrong_id),
+	CONSTRAINT wrong_answer_quiz_history_id_fkey FOREIGN KEY (quiz_history_id) REFERENCES public.quiz_history(quiz_history_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_wrong_answer_quiz_history ON public.wrong_answer USING btree (quiz_history_id);
+
+
+-- public.ai_generated_quiz definition
+
+-- Drop table
+
+-- DROP TABLE public.ai_generated_quiz;
+
+CREATE TABLE public.ai_generated_quiz (
+	quiz_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	room_id uuid NOT NULL,
+	pdf_extraction_id uuid NULL,
+	generation_time timestamptz DEFAULT now() NOT NULL,
+	question text NOT NULL,
+	choices jsonb NULL,
+	correct_answer text NOT NULL,
+	explanation text NULL,
+	concept_id uuid NULL,
+	CONSTRAINT ai_generated_quiz_pkey PRIMARY KEY (quiz_id),
+	CONSTRAINT ai_generated_quiz_concept_id_fkey FOREIGN KEY (concept_id) REFERENCES public.concept(concept_id),
+	CONSTRAINT ai_generated_quiz_pdf_extraction_id_fkey FOREIGN KEY (pdf_extraction_id) REFERENCES public.pdf_extraction_page(pdf_extraction_id) ON DELETE SET NULL,
+	CONSTRAINT ai_generated_quiz_room_id_fkey FOREIGN KEY (room_id) REFERENCES public.learning_room(room_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_ai_quiz_room_id ON public.ai_generated_quiz USING btree (room_id);
+
+
+-- public.ai_tutor_script definition
+
+-- Drop table
+
+-- DROP TABLE public.ai_tutor_script;
+
+CREATE TABLE public.ai_tutor_script (
+	script_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	room_id uuid NOT NULL,
+	generated_at timestamptz DEFAULT now() NOT NULL,
+	lecture_text text NULL,
+	audio_url text NULL,
+	tts_voice_style varchar(50) NULL,
+	CONSTRAINT ai_tutor_script_pkey PRIMARY KEY (script_id),
+	CONSTRAINT ai_tutor_script_room_id_fkey FOREIGN KEY (room_id) REFERENCES public.learning_room(room_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_ai_tutor_script_room_id ON public.ai_tutor_script USING btree (room_id);
+
+
+-- public.concept_mastery definition
+
+-- Drop table
+
+-- DROP TABLE public.concept_mastery;
+
+CREATE TABLE public.concept_mastery (
+	mastery_id uuid NOT NULL,
+	room_id uuid NOT NULL,
+	concept_id uuid NOT NULL,
+	mastery_state varchar(50) NULL,
+	last_accuracy float8 NULL,
+	avg_solve_time float8 NULL,
+	retry_count int4 NULL,
+	revisit_count int4 NULL,
+	last_updated timestamptz DEFAULT now() NULL,
+	CONSTRAINT concept_mastery_pkey PRIMARY KEY (mastery_id),
+	CONSTRAINT concept_mastery_concept_id_fkey FOREIGN KEY (concept_id) REFERENCES public.concept(concept_id),
+	CONSTRAINT concept_mastery_room_id_fkey FOREIGN KEY (room_id) REFERENCES public.learning_room(room_id)
+);

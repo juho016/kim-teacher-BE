@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from .database import get_db, engine, SessionLocal
 from . import models, schemas
-from .ai import structure, tutor, quiz, qna # QnA 모듈 임포트
+from .ai import structure, tutor, quiz, qna, cornell # 코넬 모듈 임포트
 from .analytics import engine as analytics_engine
 import io
 import os
@@ -94,10 +94,45 @@ def process_quiz_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
         for q in quiz_response.quizzes:
             new_quiz = models.AiGeneratedQuiz(quiz_id=uuid.uuid4(), room_id=room_id, concept_id=concept_id, question=q.question, choices=q.choices, correct_answer=q.correct_answer, explanation=q.explanation)
             db.add(new_quiz)
+
         db.commit()
         print(f"Quizzes generated for concept {concept.title}")
     except Exception as e:
         print(f"Error in quiz generation: {e}")
+    finally:
+        db.close()
+
+def process_cornell_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
+    db = SessionLocal()
+    try:
+        concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
+        if not concept: return
+        
+        # 이미 노트가 있으면 생성 안 함 (덮어쓰기 방지)
+        existing_note = db.query(models.CornellNote).filter_by(concept_id=concept_id, room_id=room_id).first()
+        if existing_note:
+            print(f"Cornell note already exists for concept {concept.title}")
+            return
+
+        pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == concept.pdf_id, models.PdfPage.page_number >= concept.start_page, models.PdfPage.page_number <= concept.end_page).order_by(models.PdfPage.page_number).all()
+        concept_text = "\n".join([p.page_text for p in pages if p.page_text])
+        if not concept_text: return
+
+        cornell_data = cornell.generate_cornell_note(concept.title, concept_text)
+        
+        new_note = models.CornellNote(
+            note_id=uuid.uuid4(),
+            room_id=room_id,
+            concept_id=concept_id,
+            keywords=cornell_data.keywords,
+            notes=cornell_data.notes,
+            summary=cornell_data.summary
+        )
+        db.add(new_note)
+        db.commit()
+        print(f"Cornell note generated for concept {concept.title}")
+    except Exception as e:
+        print(f"Error in cornell generation: {e}")
     finally:
         db.close()
 
@@ -147,9 +182,11 @@ def analyze_structure(pdf_id: uuid.UUID, background_tasks: BackgroundTasks, db: 
 @app.get("/pdf/{pdf_id}/concepts", response_model=schemas.ConceptListResponse)
 def get_pdf_concepts(pdf_id: uuid.UUID, db: Session = Depends(get_db)):
     pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
-    if not pdf: raise HTTPException(status_code=404, detail="PDF not found")
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
     concepts = db.query(models.Concept).filter(models.Concept.pdf_id == pdf_id).order_by(models.Concept.order_index).all()
-    if not concepts: raise HTTPException(status_code=404, detail="Concepts not found for this PDF. Please run structure analysis first.")
+    if not concepts:
+        raise HTTPException(status_code=404, detail="Concepts not found for this PDF. Please run structure analysis first.")
     return {"pdf_id": pdf_id, "concepts": concepts}
 
 @app.get("/pdf/{pdf_id}/pages", response_model=schemas.PdfPagesDetailResponse)
@@ -220,7 +257,13 @@ def submit_quiz(submission: schemas.QuizSubmission, db: Session = Depends(get_db
     for concept_id, results in concept_results.items():
         mastery = db.query(models.ConceptMastery).filter_by(room_id=submission.room_id, concept_id=concept_id).first()
         if not mastery:
-            mastery = models.ConceptMastery(mastery_id=uuid.uuid4(), room_id=submission.room_id, concept_id=concept_id, retry_count=0, avg_solve_time=0.0)
+            mastery = models.ConceptMastery(
+                mastery_id=uuid.uuid4(), 
+                room_id=submission.room_id, 
+                concept_id=concept_id,
+                retry_count=0,
+                avg_solve_time=0.0
+            )
             db.add(mastery)
         
         mastery.retry_count += 1
@@ -233,14 +276,12 @@ def submit_quiz(submission: schemas.QuizSubmission, db: Session = Depends(get_db
     
     return {"quiz_history_id": history.quiz_history_id, "score": score, "total_questions": total_questions, "wrong_answers": wrong_answers_to_save, "updated_mastery": updated_mastery_list}
 
-# --- [NEW] 개념 기반 Q&A API ---
 @app.post("/concepts/{concept_id}/qna", response_model=schemas.QnAResponse)
 def ask_question(concept_id: uuid.UUID, request: schemas.QnARequest, db: Session = Depends(get_db)):
-    user = get_or_create_test_user(db) # 실제로는 로그인된 유저 사용
+    user = get_or_create_test_user(db)
     concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
     if not concept: raise HTTPException(status_code=404, detail="Concept not found")
 
-    # 1. 개념 텍스트(Context) 수집
     pages = db.query(models.PdfPage).filter(
         models.PdfPage.pdf_id == concept.pdf_id,
         models.PdfPage.page_number >= concept.start_page,
@@ -248,15 +289,12 @@ def ask_question(concept_id: uuid.UUID, request: schemas.QnARequest, db: Session
     ).order_by(models.PdfPage.page_number).all()
     concept_text = "\n".join([p.page_text for p in pages if p.page_text])
 
-    # 2. 사용자 질문 로그 저장
     user_log = models.StudyChatLog(log_id=uuid.uuid4(), room_id=request.room_id, user_id=user.user_id, role="user", message=request.question)
     db.add(user_log)
     db.commit()
 
-    # 3. AI 답변 생성 (가드레일 적용)
     answer_text = qna.generate_answer(concept_text, request.question)
 
-    # 4. AI 답변 로그 저장
     ai_log = models.StudyChatLog(log_id=uuid.uuid4(), room_id=request.room_id, user_id=None, role="assistant", message=answer_text)
     db.add(ai_log)
     db.commit()
@@ -324,3 +362,67 @@ def get_weaknesses(room_id: uuid.UUID, db: Session = Depends(get_db)):
         "weak_concepts": weak_concepts_info,
         "message": "Weakness analysis based on mastery state."
     }
+
+@app.get("/learning-rooms/{room_id}/wrong-answers", response_model=schemas.WrongAnswerListResponse)
+def get_wrong_answers(room_id: uuid.UUID, db: Session = Depends(get_db)):
+    if not db.query(models.LearningRoom).filter(models.LearningRoom.room_id == room_id).first():
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    histories = db.query(models.QuizHistory).filter(models.QuizHistory.room_id == room_id).all()
+    history_ids = [h.quiz_history_id for h in histories]
+
+    if not history_ids:
+        return {"room_id": room_id, "wrong_answers": []}
+
+    wrong_answers = db.query(models.WrongAnswer).filter(
+        models.WrongAnswer.quiz_history_id.in_(history_ids),
+        models.WrongAnswer.is_mastered == False
+    ).all()
+
+    return {
+        "room_id": room_id,
+        "wrong_answers": wrong_answers
+    }
+
+# --- [NEW] 코넬 노트 API ---
+@app.post("/concepts/{concept_id}/cornell/generate", response_model=schemas.AnalysisResponse)
+def generate_cornell(concept_id: uuid.UUID, request: schemas.CornellNoteCreateRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
+    if not concept: raise HTTPException(status_code=404, detail="Concept not found")
+    if not db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first():
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    background_tasks.add_task(process_cornell_generation, concept_id, request.room_id)
+    return {"pdf_id": concept.pdf_id, "room_id": request.room_id, "message": "Cornell note generation started."}
+
+@app.get("/concepts/{concept_id}/cornell", response_model=schemas.CornellNoteResponse)
+def get_cornell_note(concept_id: uuid.UUID, room_id: uuid.UUID, db: Session = Depends(get_db)):
+    note = db.query(models.CornellNote).filter_by(concept_id=concept_id, room_id=room_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Cornell note not found. Generate it first.")
+    return note
+
+@app.post("/concepts/{concept_id}/cornell/save", response_model=schemas.CornellNoteResponse)
+def save_cornell_note(concept_id: uuid.UUID, request: schemas.CornellNoteSaveRequest, db: Session = Depends(get_db)):
+    note = db.query(models.CornellNote).filter_by(concept_id=concept_id, room_id=request.room_id).first()
+    if not note:
+        # 새로 생성 (사용자가 AI 생성 없이 바로 쓸 수도 있음)
+        note = models.CornellNote(
+            note_id=uuid.uuid4(),
+            room_id=request.room_id,
+            concept_id=concept_id,
+            keywords=request.keywords,
+            notes=request.notes,
+            summary=request.summary
+        )
+        db.add(note)
+    else:
+        # 업데이트
+        note.keywords = request.keywords
+        note.notes = request.notes
+        note.summary = request.summary
+        note.updated_at = datetime.now()
+    
+    db.commit()
+    db.refresh(note)
+    return note

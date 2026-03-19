@@ -79,7 +79,7 @@ class WeaknessAnalysisResponse(BaseModel):
     weak_concepts: List[WeakConceptInfo]
     message: str
 
-# --- [NEW] Q&A 관련 스키마 ---
+# --- Q&A 관련 스키마 ---
 class QnARequest(BaseModel):
     room_id: UUID
     question: str
@@ -87,6 +87,29 @@ class QnARequest(BaseModel):
 class QnAResponse(BaseModel):
     answer: str
     log_id: UUID
+
+# --- [NEW] 코넬 노트 관련 스키마 ---
+class CornellNoteBase(BaseModel):
+    keywords: List[str] = Field(..., description="왼쪽 영역의 키워드 또는 질문")
+    notes: str = Field(..., description="오른쪽 영역의 메인 필기 내용")
+    summary: str = Field(..., description="하단 영역의 요약")
+
+class CornellNoteCreateRequest(BaseModel):
+    room_id: UUID
+
+class CornellNoteSaveRequest(BaseModel):
+    room_id: UUID
+    keywords: List[str]
+    notes: str
+    summary: str
+
+class CornellNoteResponse(CornellNoteBase):
+    note_id: UUID
+    concept_id: UUID
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
 
 # --- 분석 결과 (Extraction) ---
 class ExtractionBase(BaseModel):
@@ -128,6 +151,8 @@ class ConceptSchema(BaseModel):
     description: str = Field(..., description="개념에 대한 간략한 설명")
     start_page: int = Field(..., description="개념이 시작되는 페이지 번호")
     end_page: int = Field(..., description="개념이 끝나는 페이지 번호")
+    concept_type: Optional[str] = "concept"
+    hierarchy_level: Optional[int] = 0
 
 class DocumentStructureResponse(BaseModel):
     concepts: List[ConceptSchema] = Field(..., description="문서에서 추출된 개념 목록")
@@ -194,10 +219,15 @@ class QuizSubmission(BaseModel):
     answers: List[UserAnswer]
 
 class WrongAnswerInfo(BaseModel):
+    wrong_id: Optional[UUID] = None
     question: str
     your_answer: str
     correct_answer: str
     explanation: str
+    is_mastered: bool = False
+
+    class Config:
+        from_attributes = True
 
 class QuizResultResponse(BaseModel):
     quiz_history_id: UUID
@@ -205,3 +235,7 @@ class QuizResultResponse(BaseModel):
     total_questions: int
     wrong_answers: List[WrongAnswerInfo]
     updated_mastery: List[Dict[str, Any]]
+
+class WrongAnswerListResponse(BaseModel):
+    room_id: UUID
+    wrong_answers: List[WrongAnswerInfo]
