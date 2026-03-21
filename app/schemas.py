@@ -108,6 +108,26 @@ class CornellNoteResponse(CornellNoteBase):
     concept_id: UUID
     updated_at: datetime
 
+class CornellNoteItem(BaseModel):
+    concept_id: UUID
+    title: str
+    start_page: int
+    end_page: int
+    keywords: List[str]
+    notes: str
+    summary: str
+    note_id: Optional[UUID] = None
+    updated_at: Optional[datetime] = None
+
+class CornellNoteListResponse(BaseModel):
+    pdf_id: UUID
+    room_id: UUID
+    items: List[CornellNoteItem]
+
+class CornellBulkSaveRequest(BaseModel):
+    room_id: UUID
+    items: List[CornellNoteItem]
+
     class Config:
         from_attributes = True
 

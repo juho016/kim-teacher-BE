@@ -102,37 +102,140 @@ def process_quiz_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
     finally:
         db.close()
 
-def process_cornell_generation(concept_id: uuid.UUID, room_id: uuid.UUID):
+def process_pdf_cornell_generation(pdf_id: uuid.UUID, room_id: uuid.UUID):
     db = SessionLocal()
     try:
-        concept = db.query(models.Concept).filter(models.Concept.concept_id == concept_id).first()
-        if not concept: return
-        
-        # 이미 노트가 있으면 생성 안 함 (덮어쓰기 방지)
-        existing_note = db.query(models.CornellNote).filter_by(concept_id=concept_id, room_id=room_id).first()
-        if existing_note:
-            print(f"Cornell note already exists for concept {concept.title}")
+        concepts = (
+            db.query(models.Concept)
+            .filter(models.Concept.pdf_id == pdf_id)
+            .order_by(models.Concept.order_index)
+            .all()
+        )
+
+        for concept in concepts:
+            try:
+                existing_note = db.query(models.CornellNote).filter_by(
+                    concept_id=concept.concept_id,
+                    room_id=room_id
+                ).first()
+
+                if existing_note:
+                    continue
+
+                pages = (
+                    db.query(models.PdfPage)
+                    .filter(
+                        models.PdfPage.pdf_id == concept.pdf_id,
+                        models.PdfPage.page_number >= concept.start_page,
+                        models.PdfPage.page_number <= concept.end_page
+                    )
+                    .order_by(models.PdfPage.page_number)
+                    .all()
+                )
+
+                concept_text = "\n".join([p.page_text for p in pages if p.page_text])
+                if not concept_text.strip():
+                    continue
+
+                cornell_data = cornell.generate_cornell_note(concept.title, concept_text)
+
+                new_note = models.CornellNote(
+                    note_id=uuid.uuid4(),
+                    room_id=room_id,
+                    concept_id=concept.concept_id,
+                    keywords=cornell_data.keywords,
+                    notes=cornell_data.notes,
+                    summary=cornell_data.summary
+                )
+                db.add(new_note)
+                db.commit()   # ← 개념마다 바로 커밋
+                db.refresh(new_note)
+
+                print(f"Cornell saved: {concept.title}")
+
+            except Exception as concept_error:
+                db.rollback()
+                print(f"Failed concept {concept.title}: {concept_error}")
+                continue
+
+        print(f"All Cornell generation finished for PDF {pdf_id}")
+
+    except Exception as e:
+        db.rollback()
+        print(f"Error in pdf cornell generation: {e}")
+    finally:
+        db.close()
+
+
+def process_pdf_quiz_generation(pdf_id: uuid.UUID, room_id: uuid.UUID):
+    db = SessionLocal()
+    try:
+        concepts = (
+            db.query(models.Concept)
+            .filter(models.Concept.pdf_id == pdf_id)
+            .order_by(models.Concept.order_index)
+            .all()
+        )
+
+        if not concepts:
             return
 
-        pages = db.query(models.PdfPage).filter(models.PdfPage.pdf_id == concept.pdf_id, models.PdfPage.page_number >= concept.start_page, models.PdfPage.page_number <= concept.end_page).order_by(models.PdfPage.page_number).all()
-        concept_text = "\n".join([p.page_text for p in pages if p.page_text])
-        if not concept_text: return
+        for concept in concepts:
+            try:
+                pages = (
+                    db.query(models.PdfPage)
+                    .filter(
+                        models.PdfPage.pdf_id == concept.pdf_id,
+                        models.PdfPage.page_number >= concept.start_page,
+                        models.PdfPage.page_number <= concept.end_page
+                    )
+                    .order_by(models.PdfPage.page_number)
+                    .all()
+                )
 
-        cornell_data = cornell.generate_cornell_note(concept.title, concept_text)
-        
-        new_note = models.CornellNote(
-            note_id=uuid.uuid4(),
-            room_id=room_id,
-            concept_id=concept_id,
-            keywords=cornell_data.keywords,
-            notes=cornell_data.notes,
-            summary=cornell_data.summary
-        )
-        db.add(new_note)
-        db.commit()
-        print(f"Cornell note generated for concept {concept.title}")
+                concept_text = "\n".join([p.page_text for p in pages if p.page_text])
+                if not concept_text.strip():
+                    continue
+
+                # 이미 같은 room + concept 퀴즈가 있으면 중복 생성 방지
+                existing = (
+                    db.query(models.AiGeneratedQuiz)
+                    .filter(
+                        models.AiGeneratedQuiz.room_id == room_id,
+                        models.AiGeneratedQuiz.concept_id == concept.concept_id
+                    )
+                    .first()
+                )
+                if existing:
+                    continue
+
+                quiz_response = quiz.generate_quizzes(concept.title, concept_text, num_quizzes=2)
+
+                for q in quiz_response.quizzes:
+                    new_quiz = models.AiGeneratedQuiz(
+                        quiz_id=uuid.uuid4(),
+                        room_id=room_id,
+                        concept_id=concept.concept_id,
+                        question=q.question,
+                        choices=q.choices,
+                        correct_answer=q.correct_answer,
+                        explanation=q.explanation
+                    )
+                    db.add(new_quiz)
+
+                db.commit()
+                print(f"PDF quiz saved: {concept.title}")
+
+            except Exception as concept_error:
+                db.rollback()
+                print(f"Failed concept {concept.title}: {concept_error}")
+                continue
+
+        print(f"All PDF quiz generation finished for PDF {pdf_id}")
+
     except Exception as e:
-        print(f"Error in cornell generation: {e}")
+        db.rollback()
+        print(f"Error in pdf quiz generation: {e}")
     finally:
         db.close()
 
@@ -426,3 +529,202 @@ def save_cornell_note(concept_id: uuid.UUID, request: schemas.CornellNoteSaveReq
     db.commit()
     db.refresh(note)
     return note
+
+@app.post("/pdf/{pdf_id}/cornell/generate-all", response_model=schemas.AnalysisResponse)
+def generate_pdf_cornell(
+    pdf_id: uuid.UUID,
+    request: schemas.CornellNoteCreateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    concepts = db.query(models.Concept).filter(models.Concept.pdf_id == pdf_id).all()
+    if not concepts:
+        raise HTTPException(status_code=404, detail="Concepts not found for this PDF")
+
+    background_tasks.add_task(process_pdf_cornell_generation, pdf_id, request.room_id)
+    return {
+        "pdf_id": pdf_id,
+        "room_id": request.room_id,
+        "message": "PDF Cornell note generation started."
+    }
+
+
+@app.get("/pdf/{pdf_id}/cornell", response_model=schemas.CornellNoteListResponse)
+def get_pdf_cornell_notes(
+    pdf_id: uuid.UUID,
+    room_id: uuid.UUID,
+    db: Session = Depends(get_db)
+):
+    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    concepts = (
+        db.query(models.Concept)
+        .filter(models.Concept.pdf_id == pdf_id)
+        .order_by(models.Concept.order_index)
+        .all()
+    )
+
+    if not concepts:
+        raise HTTPException(status_code=404, detail="Concepts not found for this PDF")
+
+    items = []
+    for concept in concepts:
+        note = db.query(models.CornellNote).filter_by(
+            concept_id=concept.concept_id,
+            room_id=room_id
+        ).first()
+
+        if note:
+            items.append({
+                "note_id": note.note_id,
+                "concept_id": concept.concept_id,
+                "title": concept.title,
+                "start_page": concept.start_page,
+                "end_page": concept.end_page,
+                "keywords": note.keywords or [],
+                "notes": note.notes or "",
+                "summary": note.summary or "",
+                "updated_at": note.updated_at
+            })
+
+    if not items:
+        raise HTTPException(status_code=404, detail="Cornell notes not found. Generate them first.")
+
+    return {
+        "pdf_id": pdf_id,
+        "room_id": room_id,
+        "items": items
+    }
+
+
+@app.post("/pdf/{pdf_id}/cornell/save-all", response_model=schemas.CornellNoteListResponse)
+def save_pdf_cornell_notes(
+    pdf_id: uuid.UUID,
+    request: schemas.CornellBulkSaveRequest,
+    db: Session = Depends(get_db)
+):
+    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    saved_items = []
+
+    for item in request.items:
+        concept = db.query(models.Concept).filter(
+            models.Concept.concept_id == item.concept_id,
+            models.Concept.pdf_id == pdf_id
+        ).first()
+
+        if not concept:
+            continue
+
+        note = db.query(models.CornellNote).filter_by(
+            concept_id=item.concept_id,
+            room_id=request.room_id
+        ).first()
+
+        if not note:
+            note = models.CornellNote(
+                note_id=uuid.uuid4(),
+                room_id=request.room_id,
+                concept_id=item.concept_id,
+                keywords=item.keywords,
+                notes=item.notes,
+                summary=item.summary
+            )
+            db.add(note)
+        else:
+            note.keywords = item.keywords
+            note.notes = item.notes
+            note.summary = item.summary
+            note.updated_at = datetime.now()
+
+        db.flush()
+
+        saved_items.append({
+            "note_id": note.note_id,
+            "concept_id": concept.concept_id,
+            "title": concept.title,
+            "start_page": concept.start_page,
+            "end_page": concept.end_page,
+            "keywords": note.keywords or [],
+            "notes": note.notes or "",
+            "summary": note.summary or "",
+            "updated_at": note.updated_at
+        })
+
+    db.commit()
+
+    return {
+        "pdf_id": pdf_id,
+        "room_id": request.room_id,
+        "items": saved_items
+    }
+
+@app.post("/pdf/{pdf_id}/quiz/generate-all", response_model=schemas.AnalysisResponse)
+def generate_pdf_quiz(
+    pdf_id: uuid.UUID,
+    request: schemas.AnalysisRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    room = db.query(models.LearningRoom).filter(models.LearningRoom.room_id == request.room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    concepts = db.query(models.Concept).filter(models.Concept.pdf_id == pdf_id).all()
+    if not concepts:
+        raise HTTPException(status_code=404, detail="Concepts not found for this PDF")
+
+    background_tasks.add_task(process_pdf_quiz_generation, pdf_id, request.room_id)
+    return {
+        "pdf_id": pdf_id,
+        "room_id": request.room_id,
+        "message": "PDF quiz generation started."
+    }
+
+@app.get("/pdf/{pdf_id}/quizzes")
+def get_pdf_quizzes(pdf_id: uuid.UUID, room_id: uuid.UUID, db: Session = Depends(get_db)):
+    pdf = db.query(models.Pdf).filter(models.Pdf.pdf_id == pdf_id).first()
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    quizzes = (
+        db.query(models.AiGeneratedQuiz, models.Concept.title)
+        .join(models.Concept, models.AiGeneratedQuiz.concept_id == models.Concept.concept_id)
+        .filter(
+            models.Concept.pdf_id == pdf_id,
+            models.AiGeneratedQuiz.room_id == room_id
+        )
+        .order_by(models.Concept.order_index, models.AiGeneratedQuiz.generation_time)
+        .all()
+    )
+
+    return {
+        "pdf_id": pdf_id,
+        "room_id": room_id,
+        "quizzes": [
+            {
+                "quiz_id": quiz.quiz_id,
+                "concept_id": quiz.concept_id,
+                "concept_title": concept_title,
+                "question": quiz.question,
+                "choices": quiz.choices,
+            }
+            for quiz, concept_title in quizzes
+        ]
+    }
